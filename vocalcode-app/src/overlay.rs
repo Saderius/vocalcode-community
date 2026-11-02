@@ -1326,18 +1326,23 @@ fn pico_target(window: &Window, size: (f64, f64)) -> Option<(i32, i32, i32, i32,
     let max_x = (work.right - width).max(work.left);
     let max_y = (work.bottom - height).max(work.top);
 
-    // A bound session belongs to the field, not the pointer. The widget sits at
-    // the insertion point when the provider can tell us where it is — that is
-    // where the user is looking while they speak — and otherwise in the field's
-    // bottom-right corner.
-    if let Some((caret_x, caret_y)) = vocalcode_platform::inject::pinned_caret() {
-        let mut x = caret_x + gap;
-        let mut y = caret_y + gap;
+    // A bound session belongs to the field, not the pointer.
+    if let Some((left, top, _right, bottom)) = vocalcode_platform::inject::pinned_target_rect() {
+        let inset = (6.0 * scale).round() as i32;
+        // Prefer the insertion point, but only when it is on the field's first
+        // line. Web apps often report a caret rectangle that belongs to some
+        // other node; trusting it put the widget over the composer's buttons
+        // instead of next to the text.
+        let caret = vocalcode_platform::inject::pinned_caret()
+            .filter(|(x, y)| *x >= left && *y >= top && *y <= top + (bottom - top) / 2);
+        let (anchor_x, anchor_y) = caret.unwrap_or((left + inset, top + inset));
+        let mut x = anchor_x + gap;
+        let mut y = anchor_y + gap;
         if x > max_x {
-            x = caret_x - gap - width;
+            x = anchor_x - gap - width;
         }
         if y > max_y {
-            y = caret_y - gap - height;
+            y = anchor_y - gap - height;
         }
         return Some((
             x.clamp(work.left, max_x),
@@ -1347,17 +1352,6 @@ fn pico_target(window: &Window, size: (f64, f64)) -> Option<(i32, i32, i32, i32,
             scale,
         ));
     }
-    if let Some((_, _, right, bottom)) = vocalcode_platform::inject::pinned_target_rect() {
-        let inset = (6.0 * scale).round() as i32;
-        return Some((
-            (right - width - inset).clamp(work.left, max_x),
-            (bottom - height - inset).clamp(work.top, max_y),
-            width,
-            height,
-            scale,
-        ));
-    }
-
     let mut x = point.x + gap;
     if x > max_x {
         // No room on the right: open to the left instead of clamping on top of

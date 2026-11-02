@@ -262,7 +262,11 @@ impl<D: Desktop> CursorInput<D> {
                     // From here on the pointer may go anywhere; the words still
                     // belong to this field.
                     if let Some(target) = self.desktop.last_target() {
-                        log::info!("cursor input: pinning the field under the click");
+                        log::info!(
+                            "cursor input: pinning field rect={:?} caret={:?}",
+                            target.rect,
+                            target.caret
+                        );
                         vocalcode_platform::inject::pin_target(target);
                         self.session = true;
                     } else {

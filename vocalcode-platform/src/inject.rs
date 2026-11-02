@@ -808,7 +808,7 @@ fn pinned_target() -> Option<PinnedTarget> {
 /// different control ends up focused, this reports failure and the transcript
 /// takes the existing recoverable path instead of being typed somewhere wrong.
 #[cfg(windows)]
-pub fn focus_pinned(target: &PinnedTarget) -> bool {
+pub fn focus_pinned(target: &PinnedTarget) -> Option<FocusToken> {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     // Declared here: the windows-sys projection does not expose it under any
@@ -886,7 +886,20 @@ pub fn focus_pinned(target: &PinnedTarget) -> bool {
         unsafe { GetForegroundWindow() } == hwnd,
         current.as_ref() == Some(&target.token)
     );
-    current.as_ref() == Some(&target.token)
+    if current.as_ref() == Some(&target.token) {
+        return Some(target.token.clone());
+    }
+    // Web apps rebuild their accessibility tree constantly, so the element that
+    // comes back after activation is often a different node for the same field.
+    // Demanding the exact runtime id turned that into "your words went to the
+    // clipboard". Accept what the app actually focused, as long as it is the
+    // pinned window and it is a real text target.
+    if unsafe { GetForegroundWindow() } != hwnd {
+        return None;
+    }
+    let focused = focused_text_target()?;
+    log::info!("focus_pinned: accepted the rebuilt element in the pinned window");
+    Some(focused)
 }
 /// The control under a physical screen point, when it would accept text.
 ///
@@ -2345,12 +2358,12 @@ impl TextInjector for EnigoInjector {
         // failure this exists to prevent.
         #[cfg(windows)]
         if let Some(pinned) = pinned_target() {
-            if focus_pinned(&pinned) {
+            if let Some(token) = focus_pinned(&pinned) {
                 log::info!(
                     "inject: {} chars into the pinned field",
                     text.chars().count()
                 );
-                return insert_into(self, pinned.token, text);
+                return insert_into(self, token, text);
             }
             log::info!("inject: the pinned field could not be refocused");
         }
