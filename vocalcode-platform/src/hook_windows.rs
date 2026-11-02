@@ -103,6 +103,74 @@ fn remember_position(x: i32, y: i32) {
     );
 }
 
+/// The last left-button press, as the hook saw it.
+///
+/// `seq` increments on every press so a poller can tell a new click from the
+/// same one; `time_ms` is the system tick `MSLLHOOKSTRUCT` carries, which is the
+/// same clock Windows itself uses to decide what counts as a double-click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerClick {
+    pub seq: u64,
+    pub x: i32,
+    pub y: i32,
+    pub time_ms: u32,
+}
+
+static CLICK_SEQ: AtomicU64 = AtomicU64::new(0);
+static CLICK_POSITION: AtomicU64 = AtomicU64::new(POSITION_UNKNOWN);
+static CLICK_TIME_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The most recent left-button press that was not itself synthetic.
+///
+/// Injected clicks are excluded on purpose: the app types text and presses keys
+/// through `SendInput`, and a controller that counted those would toggle itself.
+/// Nothing is consumed — the click still reaches the application underneath,
+/// which is exactly what the double-click gesture depends on.
+pub fn last_left_click() -> Option<PointerClick> {
+    let seq = CLICK_SEQ.load(Ordering::Acquire);
+    if seq == 0 {
+        return None;
+    }
+    let packed = CLICK_POSITION.load(Ordering::Acquire);
+    if packed == POSITION_UNKNOWN {
+        return None;
+    }
+    Some(PointerClick {
+        seq,
+        x: (packed >> 32) as u32 as i32,
+        y: packed as u32 as i32,
+        time_ms: CLICK_TIME_MS.load(Ordering::Acquire) as u32,
+    })
+}
+
+/// Debug-only: also count clicks that `SendInput` produced.
+///
+/// A real user's click is never injected, and counting synthetic ones would let
+/// another automation tool toggle dictation. The escape hatch exists so the
+/// gesture can be exercised end-to-end from a test script, and it is compiled
+/// out of release builds entirely.
+#[cfg(any(test, debug_assertions))]
+fn count_injected_clicks() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("VOCALCODE_TRACE_CLICKS").is_some())
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+fn count_injected_clicks() -> bool {
+    false
+}
+
+#[inline]
+fn remember_left_click(x: i32, y: i32, time_ms: u32) {
+    CLICK_POSITION.store(
+        ((x as u32 as u64) << 32) | (y as u32 as u64),
+        Ordering::Release,
+    );
+    CLICK_TIME_MS.store(u64::from(time_ms), Ordering::Release);
+    CLICK_SEQ.fetch_add(1, Ordering::AcqRel);
+}
+
 #[derive(Debug)]
 struct HeartbeatWatchdog {
     last: u64,
@@ -229,6 +297,12 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         // one relaxed store with no lock, no dispatch and no log, so it stays
         // inside the callback budget the module contract requires.
         remember_position(mouse.pt.x, mouse.pt.y);
+        // A press is the only thing the double-click gesture needs; releases and
+        // injected clicks are not. Stored before dispatch so the position and
+        // the tick belong to the same event the handler sees.
+        if wparam as u32 == WM_LBUTTONDOWN && (!injected || count_injected_clicks()) {
+            remember_left_click(mouse.pt.x, mouse.pt.y, mouse.time);
+        }
         let event = match wparam as u32 {
             WM_LBUTTONDOWN => Some(EventType::ButtonPress(Button::Left)),
             WM_LBUTTONUP => Some(EventType::ButtonRelease(Button::Left)),

@@ -517,6 +517,153 @@ fn no_text_target_message() -> String {
     )
 }
 
+/// Whether a UIA element is a control that would accept synthesised text.
+///
+/// This is the conservative predicate the whole feature depends on, so it is
+/// written once and shared by the two callers: the focused-element path that
+/// guards delivery, and the point probe that decides whether the cursor dot
+/// arms. A desktop, a game or a file list exposes none of these patterns and
+/// therefore never arms.
+#[cfg(windows)]
+fn windows_element_accepts_text(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> bool {
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationTextPattern, IUIAutomationValuePattern, UIA_DocumentControlTypeId,
+        UIA_EditControlTypeId, UIA_TextPatternId, UIA_ValuePatternId,
+    };
+
+    if unsafe { element.CurrentIsPassword() }
+        .map(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // A read-only ValuePattern is the one case where the provider says outright
+    // that typing will not take, so believe it. Everything below is an accept:
+    // the patterns and control types a provider exposes when text goes there.
+    if let Ok(value) =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+    {
+        return !unsafe { value.CurrentIsReadOnly() }
+            .map(|read_only| read_only.as_bool())
+            .unwrap_or(false);
+    }
+    let Ok(control_type) = (unsafe { element.CurrentControlType() }) else {
+        return false;
+    };
+    if control_type == UIA_EditControlTypeId || control_type == UIA_DocumentControlTypeId {
+        return true;
+    }
+    unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }.is_ok()
+}
+
+/// A UI Automation client cached for the life of the calling thread.
+///
+/// `with_windows_automation` creates and destroys a `CUIAutomation` on every
+/// call, which is fine for a one-off insertion but not for a probe that runs
+/// sixteen times a second. This variant keeps one client per thread and leaves
+/// the apartment initialized: the only caller is the point-probe worker, whose
+/// lifetime is the process's.
+#[cfg(windows)]
+fn with_cached_automation<R>(
+    operation: impl FnOnce(&windows::Win32::UI::Accessibility::IUIAutomation) -> Option<R>,
+) -> Option<R> {
+    use std::cell::RefCell;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+
+    thread_local! {
+        static AUTOMATION: RefCell<Option<IUIAutomation>> = const { RefCell::new(None) };
+    }
+
+    AUTOMATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let created = unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
+            };
+            *slot = created;
+        }
+        let automation = slot.as_ref()?;
+        operation(automation)
+    })
+}
+
+/// Whether the control under a physical screen point would accept text.
+///
+/// Advisory: this drives the cursor dot's appearance. Delivery is still gated by
+/// [`focused_text_target`], which re-checks the element that actually has focus
+/// at commit time. A point probe can therefore never widen what the injector
+/// will write into.
+///
+/// `false` on any failure, including a provider that does not answer — the
+/// caller must never arm on an unknown.
+#[cfg(windows)]
+pub fn text_target_at_point(x: i32, y: i32) -> bool {
+    let point = windows::Win32::Foundation::POINT { x, y };
+    with_cached_automation(|automation| {
+        let element = unsafe { automation.ElementFromPoint(point) }.ok()?;
+        Some(windows_element_accepts_text(&element))
+    })
+    .unwrap_or(false)
+}
+
+/// Whether the focused control accepts text right now.
+///
+/// The cursor controller calls this at the moment of a double-click: the click
+/// itself has already moved focus to the field, so this is the same trusted
+/// check delivery uses, not a second opinion from the point probe.
+#[cfg(windows)]
+pub fn focused_target_is_editable() -> bool {
+    focused_text_target().is_some()
+}
+
+/// Collapse a text selection to its right edge with a single Right-arrow.
+///
+/// The double-click gesture always reaches the application first, so it selects
+/// a word before this feature can act. Without collapsing that selection the
+/// first dictated phrase would replace the word the user pointed at; with it,
+/// text lands after the word, which is what "dictate here" means.
+///
+/// The edge case is a field where the double-click selected nothing (an empty
+/// field, or a caret already at the end): the arrow is then a no-op because the
+/// caret has nowhere to go.
+#[cfg(windows)]
+pub fn collapse_selection() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_RIGHT,
+    };
+
+    let stroke = |flags: u32| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_RIGHT,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [stroke(0), stroke(KEYEVENTF_KEYUP)];
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        );
+    }
+}
+
+/// No pointer tap on this platform yet.
+#[cfg(not(windows))]
+pub fn collapse_selection() {}
+
 /// The focused control, when synthesised text would actually land there as
 /// text.
 ///
@@ -525,35 +672,7 @@ fn no_text_target_message() -> String {
 /// characters would arrive as a burst of keyboard shortcuts.
 #[cfg(windows)]
 fn focused_text_target() -> Option<FocusToken> {
-    use windows::Win32::UI::Accessibility::{
-        IUIAutomationTextPattern, IUIAutomationValuePattern, UIA_DocumentControlTypeId,
-        UIA_EditControlTypeId, UIA_TextPatternId, UIA_ValuePatternId,
-    };
-
-    with_windows_focused(|element, token| {
-        if unsafe { element.CurrentIsPassword() }.ok()?.as_bool() {
-            return None;
-        }
-        // A read-only ValuePattern is the one case where the provider says
-        // outright that typing will not take, so believe it. Everything below is
-        // an accept: the patterns and control types a provider exposes when text
-        // goes there. A desktop, a game or a file list exposes none of them.
-        if let Ok(value) =
-            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
-        {
-            if unsafe { value.CurrentIsReadOnly() }.ok()?.as_bool() {
-                return None;
-            }
-            return Some(token);
-        }
-        let control_type = unsafe { element.CurrentControlType() }.ok()?;
-        if control_type == UIA_EditControlTypeId || control_type == UIA_DocumentControlTypeId {
-            return Some(token);
-        }
-        unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }
-            .ok()
-            .map(|_| token)
-    })
+    with_windows_focused(|element, token| windows_element_accepts_text(element).then_some(token))
 }
 
 #[cfg(target_os = "macos")]

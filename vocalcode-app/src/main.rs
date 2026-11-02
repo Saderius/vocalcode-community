@@ -13,6 +13,8 @@ mod community;
 mod control_bar;
 #[cfg(windows)]
 mod cursor_dot;
+#[cfg(windows)]
+mod cursor_input;
 mod diagnostics;
 mod dictation_control;
 mod inference;
@@ -3827,6 +3829,7 @@ fn start_background(
     let config = shared_config.lock().unwrap().clone();
     let (tx, rx) = trigger_event_channel();
     status.dictation_control.connect(tx.clone());
+    status.cursor_control.connect(tx.clone());
     let input_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let input_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -4151,6 +4154,10 @@ fn start_background(
         status.ready.store(
             engine_ready(audio_ready, model_ready, &input_ready, &status),
             Ordering::Release,
+        );
+        log::info!(
+            "engine ready={} (audio={audio_ready} model={model_ready})",
+            status.ready.load(Ordering::Acquire)
         );
         // `setlang` wakes first-run preparation by setting this flag before an
         // engine exists. The model we just built already incorporates that
@@ -4991,17 +4998,36 @@ fn start_background(
             // Cancel/ForceStop/Quit discard ordinary queued starts there. Its
             // Wake must first pass the same ordered/emergency-aware receiver.
             let control_dispatch = if matches!(input, Ok(TriggerEvent::Wake)) {
-                status.dictation_control.take(
-                    overlay.snapshot(),
-                    status.ready.load(Ordering::Acquire)
-                        && !status.shutdown.load(Ordering::Acquire),
-                    engine.is_recording(),
-                    active_config.desktop_control,
-                    Instant::now(),
-                )
+                let ready = status.ready.load(Ordering::Acquire)
+                    && !status.shutdown.load(Ordering::Acquire);
+                let recording = engine.is_recording();
+                let now = Instant::now();
+                status
+                    .dictation_control
+                    .take(
+                        overlay.snapshot(),
+                        ready,
+                        recording,
+                        active_config.desktop_control,
+                        now,
+                    )
+                    // Cursor input owns a second mailbox. Consult it only when
+                    // the first produced nothing, so a desktop-control click
+                    // keeps priority over a stray double-click in the same
+                    // millisecond.
+                    .or_else(|| {
+                        status.cursor_control.take(
+                            overlay.snapshot(),
+                            ready,
+                            recording,
+                            active_config.cursor_input.enabled,
+                            now,
+                        )
+                    })
             } else {
                 if let Ok(event) = input {
                     status.dictation_control.observe_control(event);
+                    status.cursor_control.observe_control(event);
                 }
                 None
             };

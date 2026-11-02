@@ -355,6 +355,10 @@ pub struct RuntimeStatus {
     pub meetings: crate::meeting::Bridge,
     pub listening: AtomicBool,
     pub dictation_control: crate::dictation_control::Bridge,
+    /// Cursor-native input's own mailbox. A second `Bridge` rather than a share
+    /// of the one above: `Bridge` is a single-slot mailbox with a busy latch, so
+    /// two producers on it reject each other's requests.
+    pub cursor_control: Arc<crate::dictation_control::Bridge>,
     /// False until the ASR model is downloaded + loaded and the engine is live.
     /// Drives the "Setting up…" banner so first-launch isn't a blind wait.
     pub ready: Arc<AtomicBool>,
@@ -1585,6 +1589,8 @@ pub fn run(
     #[cfg(windows)]
     let mut cursor_dot: Option<crate::cursor_dot::CursorDot> = None;
     #[cfg(windows)]
+    let mut cursor_input: Option<crate::cursor_input::CursorInput> = None;
+    #[cfg(windows)]
     let mut cursor_dot_attempted = false;
     let demo_overlay = std::env::var("VOCALCODE_OVERLAY_DEMO").as_deref() == Ok("1");
     // Notices and the tray tooltip follow the interface language. The last
@@ -1874,15 +1880,17 @@ pub fn run(
                 }
             }
         }
-        // The cursor dot is a follower: it samples the pointer every frame and
-        // asks for the next one. Its visual state stays Idle until the target
-        // probe exists (M2); for now this proves the window, the DPI handling
-        // and the click-through contract on a real desktop.
+        // Cursor-native input: the dot follows the pointer, the probe decides
+        // whether the point under it accepts text, and a double-click on such a
+        // point starts or stops dictation through the cursor mailbox.
         #[cfg(windows)]
         if let Ok(c) = tick_cfg.try_lock() {
             let enabled = c.cursor_input.enabled && !status.shutdown.load(Ordering::Acquire);
             if enabled && !cursor_dot_attempted {
                 cursor_dot_attempted = true;
+                cursor_input = Some(crate::cursor_input::CursorInput::new(
+                    status.cursor_control.clone(),
+                ));
                 cursor_dot = match crate::cursor_dot::CursorDot::new(event_target) {
                     Ok(dot) => {
                         log::info!("cursor dot created");
@@ -1899,13 +1907,21 @@ pub fn run(
             }
             if !enabled {
                 cursor_dot = None;
+                cursor_input = None;
             }
-            if let Some(dot) = &mut cursor_dot {
-                dot.tick(crate::cursor_dot::CursorVisual::Idle);
-                if let (Some(deadline), ControlFlow::WaitUntil(existing)) =
-                    (Some(crate::cursor_dot::next_wake(Instant::now())), &mut *control_flow)
-                {
-                    *existing = (*existing).min(deadline);
+            if let (Some(dot), Some(controller)) = (&mut cursor_dot, &mut cursor_input) {
+                let snapshot = overlay_state.snapshot();
+                let visual = controller.tick(
+                    snapshot,
+                    status.ready.load(Ordering::Acquire)
+                        && !status.shutdown.load(Ordering::Acquire),
+                    snapshot.phase == crate::overlay::Phase::Recording,
+                    true,
+                    Instant::now(),
+                );
+                dot.tick(visual);
+                if let ControlFlow::WaitUntil(existing) = &mut *control_flow {
+                    *existing = (*existing).min(crate::cursor_dot::next_wake(Instant::now()));
                 }
             }
         }

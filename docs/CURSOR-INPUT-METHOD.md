@@ -1,6 +1,6 @@
 # Cursor-Anchored Voice Input — Project Plan
 
-Status: **rev 3** (gesture decided) · Branch: `feat/cursor-input-method` · 2026-11-02
+Status: **rev 4** (Pico Mode added; M1–M3 landed) · Branch: `feat/cursor-input-method` · 2026-11-02
 
 Rev 1 was written from the README and a file listing. Rev 2 corrects it against
 `docs/research/cursor-input-codebase-map.md`, which is the evidence base for every
@@ -92,6 +92,36 @@ Two separate problems, only the first is new:
 
 Reuse the existing injector and its guards. Text lands at the caret of the target
 that was armed when dictation started.
+
+---
+
+## 3A. Pico Mode — the panel lives at the dot
+
+The point of this fork is not only a new trigger; it is a **new kind of overlay
+UI**. Today the app has one floating surface, pinned to the bottom of the
+foreground monitor: the capsule that shows *Learning…*, *Listening*, the level
+meter and notices.
+
+**Pico Mode** moves that panel onto the dot.
+
+| Today | Pico Mode |
+| --- | --- |
+| Panel sits at the bottom-centre of the screen, far from the work | Panel grows out of the dot, at the pointer |
+| You look away from the field to read it | It appears where you are already looking |
+| One position for every app | The anchor is the thing you are editing |
+
+Stages:
+
+1. **Pico dot** — a small state indicator at the pointer (done, M1).
+2. **Pico panel** — the capsule's content (phase, meter, notices) morphs out of
+   the dot on demand, and collapses back to a dot when idle.
+3. **Field merge** — once the probe knows an editable target, the dot can settle
+   *into* the field's corner rather than floating over the text, and return to
+   the cursor when dictation ends.
+
+The dot and the panel must not both be visible in the same place at the same
+time: Pico Mode *replaces* the bottom-centre capsule for users who opt in, and
+the existing overlay style remains the default.
 
 ---
 
@@ -188,11 +218,12 @@ Rules for that probe, learned the hard way from the existing code:
 | # | Milestone | Exit criteria |
 | --- | --- | --- |
 | **M0** | Toolchain and a reproducible local build | `cargo build -p vocalcode-app --release --locked --features community`; `--build-info` reports `"identity": "development"` |
-| **M1** | Pointer capture + dot follows | Position captured in the hook; dot tracks across monitors and DPIs; clicks and focus untouched; no idle CPU regression |
-| **M2** | Point-based arming | Arms over Notepad, browser `<input>` and `contenteditable`, VS Code, Word; idle over desktop/taskbar/elevated; probe has a hard timeout and cannot hang the UI |
-| **M3** | Toggle wired | Double-click an armed target starts dictation; second double-click sends `ForceStop`; selection collapsed before delivery so nothing is overwritten; cancel gesture defined |
-| **M4** | Polish | Waveform, `Blocked` states, fullscreen/lock handling, DPI crossings without resize drift |
-| **M5** | Ship-quality | Settings UI, docs, `cursor_dot_hidden_smoke`, manual QA matrix, no regression in existing tests |
+| **M1** | Pointer capture + dot follows | done - Position captured in the hook; dot tracks across monitors and DPIs; clicks and focus untouched |
+| **M2** | Point-based arming | done - Arms over Notepad, TextBox, browsers; idle over desktop/taskbar; probe has a hard timeout and cannot hang the UI |
+| **M3** | Toggle wired | done - Double-click starts dictation; second sends `ForceStop`; selection collapsed before delivery |
+| **M4** | Pico panel | The capsule's content morphs out of the dot and collapses back |
+| **M5** | Field merge | Dot settles into the editable target's corner, returns to the cursor on stop |
+| **M6** | Polish + ship | Waveform, `Blocked` states, fullscreen/lock handling, settings UI, docs, hidden smoke, QA matrix |
 
 ---
 

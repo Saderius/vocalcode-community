@@ -265,7 +265,7 @@ fn render(visual: CursorVisual, d: i32) -> Vec<u8> {
 /// pointer it is the wrong tool: it only updates when the hook delivers an
 /// event, so a programmatic `SetCursorPos` (and some remote-desktop paths)
 /// leave it stale. `GetCursorPos` costs microseconds and is always current.
-fn pointer_position() -> Option<(i32, i32)> {
+pub(crate) fn pointer_position() -> Option<(i32, i32)> {
     let mut point = POINT { x: 0, y: 0 };
     if unsafe { GetCursorPos(&mut point) } == 0 {
         None
