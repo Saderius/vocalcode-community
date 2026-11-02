@@ -677,6 +677,75 @@ pub struct PinnedTarget {
     token: FocusToken,
     /// Physical screen rectangle: `(left, top, right, bottom)`.
     pub rect: (i32, i32, i32, i32),
+    /// Where the text caret was, in physical pixels, when the field was chosen.
+    ///
+    /// The widget belongs at the insertion point, not at the pointer and not at
+    /// the field's corner: that is where the user is looking while they speak.
+    pub caret: Option<(i32, i32)>,
+}
+
+/// The insertion point of a text element, read from its `TextPattern`.
+///
+/// A collapsed selection has zero width, and its rectangle's bottom edge is
+/// exactly where the caret is drawn.
+#[cfg(windows)]
+unsafe fn caret_point(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Option<(i32, i32)> {
+    use windows::Win32::UI::Accessibility::{IUIAutomationTextPattern, UIA_TextPatternId};
+
+    let text = element
+        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+        .ok()?;
+    let selection = text.GetSelection().ok()?;
+    if selection.Length().ok()? < 1 {
+        return None;
+    }
+    let range = selection.GetElement(0).ok()?;
+    let array = range.GetBoundingRectangles().ok()?;
+    let values = read_f64_array(array)?;
+    if values.len() < 4 {
+        return None;
+    }
+    let (x, y, _width, height) = (values[0], values[1], values[2], values[3]);
+    if !x.is_finite() || !y.is_finite() || !height.is_finite() {
+        return None;
+    }
+    Some((x as i32, (y + height) as i32))
+}
+
+/// Read a `SAFEARRAY` of doubles and release it.
+#[cfg(windows)]
+unsafe fn read_f64_array(array: *mut windows::Win32::System::Com::SAFEARRAY) -> Option<Vec<f64>> {
+    use windows::Win32::System::Ole::{
+        SafeArrayDestroy, SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetLBound,
+        SafeArrayGetUBound,
+    };
+
+    if array.is_null() {
+        return None;
+    }
+    let values = (|| {
+        if SafeArrayGetDim(array) != 1 {
+            return None;
+        }
+        let lower = SafeArrayGetLBound(array, 1).ok()?;
+        let upper = SafeArrayGetUBound(array, 1).ok()?;
+        let mut values = Vec::new();
+        for index in lower..=upper {
+            let mut value: f64 = 0.0;
+            SafeArrayGetElement(
+                array,
+                &index,
+                &mut value as *mut f64 as *mut core::ffi::c_void,
+            )
+            .ok()?;
+            values.push(value);
+        }
+        Some(values)
+    })();
+    let _ = SafeArrayDestroy(array);
+    values
 }
 
 #[cfg(windows)]
@@ -711,6 +780,14 @@ pub fn pinned_target_rect() -> Option<(i32, i32, i32, i32)> {
         .lock()
         .ok()
         .and_then(|slot| slot.as_ref().map(|target| target.rect))
+}
+
+#[cfg(windows)]
+pub fn pinned_caret() -> Option<(i32, i32)> {
+    pinned_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|target| target.caret))
 }
 
 #[cfg(windows)]
@@ -782,8 +859,28 @@ pub fn focus_pinned(target: &PinnedTarget) -> bool {
             std::thread::sleep(std::time::Duration::from_millis(60));
         }
     }
-    let current = current_focus();
-    #[cfg(debug_assertions)]
+    let mut current = current_focus();
+    if current.as_ref() != Some(&target.token) {
+        // Web content keeps its own focus model: the window comes back but the
+        // exact element often does not. Ask the element under the pinned point
+        // to take focus directly. This is also what makes the caret come back
+        // for Chromium and Electron fields.
+        let (left, top, right, bottom) = target.rect;
+        let _ = with_cached_automation(|automation| {
+            let point = windows::Win32::Foundation::POINT {
+                x: (left + right) / 2,
+                y: (top + bottom) / 2,
+            };
+            let element = unsafe { automation.ElementFromPoint(point) }.ok()?;
+            if !windows_element_accepts_text(&element) {
+                return None;
+            }
+            unsafe { element.SetFocus() }.ok()?;
+            Some(())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        current = current_focus();
+    }
     log::info!(
         "focus_pinned: foreground_restored={} token_matches={}",
         unsafe { GetForegroundWindow() } == hwnd,
@@ -833,6 +930,7 @@ pub fn target_at_point(x: i32, y: i32) -> Option<PinnedTarget> {
                 runtime_id,
             },
             rect: (rect.left, rect.top, rect.right, rect.bottom),
+            caret: unsafe { caret_point(&element) },
         })
     })
 }
@@ -2248,18 +2346,15 @@ impl TextInjector for EnigoInjector {
         #[cfg(windows)]
         if let Some(pinned) = pinned_target() {
             if focus_pinned(&pinned) {
-                #[cfg(debug_assertions)]
                 log::info!(
                     "inject: {} chars into the pinned field",
                     text.chars().count()
                 );
                 return insert_into(self, pinned.token, text);
             }
-            #[cfg(debug_assertions)]
             log::info!("inject: the pinned field could not be refocused");
         }
         let delivery = self.delivery()?;
-        #[cfg(debug_assertions)]
         log::info!(
             "inject: {} chars, delivery={}",
             text.chars().count(),
