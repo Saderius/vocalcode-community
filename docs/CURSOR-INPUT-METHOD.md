@@ -227,8 +227,8 @@ Rules for that probe, learned the hard way from the existing code:
 | **M1** | Pointer capture + dot follows | done - Position captured in the hook; dot tracks across monitors and DPIs; clicks and focus untouched |
 | **M2** | Point-based arming | done - Arms over Notepad, TextBox, browsers; idle over desktop/taskbar; probe has a hard timeout and cannot hang the UI |
 | **M3** | Toggle wired | done - Double-click starts dictation; second sends `ForceStop`; selection collapsed before delivery |
-| **M4** | Pico panel | The capsule's content morphs out of the dot and collapses back |
-| **M5** | Field merge | Dot settles into the editable target's corner, returns to the cursor on stop |
+| **M4** | Pico panel | done - the capsule grows out of the dot (25x25 -> 301x60 over 200 ms) and collapses back (140 ms), skipping the animation when Windows animations are off |
+| **M5** | Field merge (next) | Dot settles into the editable target's corner, returns to the cursor on stop |
 | **M6** | Polish + ship | Waveform, `Blocked` states, fullscreen/lock handling, settings UI, docs, hidden smoke, QA matrix |
 
 ---
