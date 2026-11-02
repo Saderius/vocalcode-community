@@ -2048,7 +2048,17 @@ impl TextInjector for EnigoInjector {
         if text.is_empty() {
             return Ok(());
         }
-        match self.delivery()? {
+        let delivery = self.delivery()?;
+        #[cfg(debug_assertions)]
+        log::info!(
+            "inject: {} chars, delivery={}",
+            text.chars().count(),
+            match &delivery {
+                Delivery::Type(_) => "type",
+                Delivery::Clipboard => "clipboard",
+            }
+        );
+        match delivery {
             Delivery::Type(target) => {
                 // Re-arm to the control actually about to be typed into. The
                 // checks inside the typing and pasting paths then go on doing

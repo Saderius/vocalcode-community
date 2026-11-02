@@ -39,9 +39,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Diameter of the dot at 100 % scale, in logical pixels.
-const DOT_LOGICAL: f64 = 14.0;
+pub(crate) const DOT_LOGICAL: f64 = crate::overlay::PICO_DOT_LOGICAL;
 /// Gap between the pointer hotspot and the dot's top-left corner.
-const OFFSET_LOGICAL: f64 = 10.0;
+pub(crate) const OFFSET_LOGICAL: f64 = crate::overlay::PICO_OFFSET_LOGICAL;
 /// Pointer cadence while the dot is on. 30 Hz is smooth for a 14 px object and
 /// costs one `SetWindowPos` per moved frame.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);

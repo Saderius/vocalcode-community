@@ -37,6 +37,8 @@ mod support;
 mod test_support;
 #[cfg(test)]
 mod voice_corpus;
+#[cfg(debug_assertions)]
+mod wav_capture;
 mod webui;
 mod workflows;
 
@@ -3910,8 +3912,12 @@ fn start_background(
         let _ready_reset = ReadyReset(status.ready.clone());
         let corrections = CorrectionMonitor::new();
         let shared_level = AudioLevel::default();
-        let (mut audio, mut audio_ready): (Box<dyn AudioCapture>, bool) =
-            match CpalAudioCapture::new_for_with_level(
+        let (mut audio, mut audio_ready): (Box<dyn AudioCapture>, bool) = match replay_capture() {
+            Some(capture) => {
+                log::warn!("audio: replaying VOCALCODE_AUDIO_WAV instead of the microphone");
+                (capture, true)
+            }
+            None => match CpalAudioCapture::new_for_with_level(
                 config.input_device.as_deref(),
                 shared_level.clone(),
             ) {
@@ -3922,7 +3928,8 @@ fn start_background(
                     report_runtime_error(&status, format!("Could not open the microphone: {e}"));
                     (Box::new(UnavailableAudio(e.to_string())), false)
                 }
-            };
+            },
+        };
         status
             .microphone_failed
             .store(!audio_ready, Ordering::Release);
@@ -5944,6 +5951,26 @@ where
             result
         }
     }
+}
+
+/// Debug builds can replay a WAV instead of the microphone, so a full dictation
+/// — capture, recognition, delivery — can be exercised without anyone speaking.
+/// Release builds always use the real microphone.
+#[cfg(debug_assertions)]
+fn replay_capture() -> Option<Box<dyn AudioCapture>> {
+    let path = std::env::var_os("VOCALCODE_AUDIO_WAV")?;
+    match wav_capture::WavCapture::open(std::path::Path::new(&path)) {
+        Ok(capture) => Some(Box::new(capture)),
+        Err(error) => {
+            log::error!("VOCALCODE_AUDIO_WAV could not be read: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn replay_capture() -> Option<Box<dyn AudioCapture>> {
+    None
 }
 
 fn main() -> anyhow::Result<()> {

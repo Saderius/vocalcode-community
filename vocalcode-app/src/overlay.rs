@@ -64,6 +64,26 @@ const MINI_WINDOW_H: f64 = 22.0;
 const BOTTOM_MARGIN: f64 = 8.0;
 /// How long a notice stays up: one short line, read comfortably once.
 const NOTICE_DURATION: Duration = Duration::from_secs(3);
+
+/// Pico Mode's open/close animation.
+///
+/// The native window is interpolated between the dot's rectangle and the
+/// capsule's while the page scales the drawn pill to match, so the panel grows
+/// out of the dot instead of appearing beside it. Closing is faster: a late
+/// hide is what makes an overlay feel sticky.
+const MORPH_OPEN: Duration = Duration::from_millis(200);
+const MORPH_CLOSE: Duration = Duration::from_millis(140);
+
+/// Shared with `cursor_dot`: the panel grows out of the dot, so both surfaces
+/// must agree on one diameter and one offset.
+pub(crate) const PICO_DOT_LOGICAL: f64 = 14.0;
+pub(crate) const PICO_OFFSET_LOGICAL: f64 = 10.0;
+
+#[derive(Debug, Clone, Copy)]
+struct Morph {
+    started: Instant,
+    opening: bool,
+}
 /// Notice capsule bounds on Windows, where the window hugs the capsule.
 #[cfg(any(windows, test))]
 pub(crate) const NOTICE_MIN_W: f64 = 140.0;
@@ -359,6 +379,8 @@ pub struct Overlay {
     style: Style,
     /// Where the capsule is placed. Pico Mode follows the pointer.
     anchor: Anchor,
+    /// An open or close animation in flight, if any.
+    morph: Option<Morph>,
     /// The style changed and the page has not been told yet.
     style_pending: bool,
     /// The interface language preference, and whether the page has it yet.
@@ -482,6 +504,7 @@ impl Overlay {
             meter_updates: MeterUpdates::default(),
             style: Style::Classic,
             anchor: Anchor::Screen,
+            morph: None,
             style_pending: false,
             lang: String::new(),
             lang_pending: false,
@@ -582,8 +605,11 @@ impl Overlay {
     /// somewhere else on the screen.
     fn place(&self) {
         #[cfg(windows)]
-        if self.anchor == Anchor::Cursor && position_at_cursor(&self.window, self.frame) {
-            return;
+        if self.anchor == Anchor::Cursor {
+            if let Some((x, y, width, height, _)) = pico_target(&self.window, self.frame) {
+                set_pico_rect(&self.window, (x, y, width, height));
+                return;
+            }
         }
         #[cfg(windows)]
         if position_on_windows_work_area(&self.window, self.frame, self.keep_clear) {
@@ -678,49 +704,61 @@ impl Overlay {
         // A permanent mark is a real cost on a small laptop display, and this
         // indicator has no hover affordance that would justify one.
         let want = display.wants_window(self.style);
-        if want != self.shown {
-            if want {
-                if self.lang_pending {
-                    // Config files are user-editable. Encode the value as a JS
-                    // string literal instead of trying to sanitize individual
-                    // quote characters before evaluating it in the WebView.
-                    let _ = self
-                        .webview
-                        .evaluate_script(&overlay_language_script(&self.lang));
-                    self.lang_pending = false;
-                }
-                if self.style_pending {
-                    let name = match self.style {
-                        Style::Mini => "mini",
-                        _ => "classic",
-                    };
-                    let _ = self
-                        .webview
-                        .evaluate_script(&format!("window.vcStyle && vcStyle('{name}')"));
-                    self.style_pending = false;
-                }
-                self.place();
-                #[cfg(target_os = "macos")]
-                self.panel.sync_frame_from(&self.window);
+        // A close in flight is cancelled by a new open: the panel must not
+        // finish shrinking after the user has already started again.
+        if want && self.shown && self.morph.is_some_and(|morph| !morph.opening) {
+            self.morph = None;
+        }
+        if want && !self.shown {
+            if self.lang_pending {
+                // Config files are user-editable. Encode the value as a JS
+                // string literal instead of trying to sanitize individual
+                // quote characters before evaluating it in the WebView.
+                let _ = self
+                    .webview
+                    .evaluate_script(&overlay_language_script(&self.lang));
+                self.lang_pending = false;
             }
+            if self.style_pending {
+                let name = match self.style {
+                    Style::Mini => "mini",
+                    _ => "classic",
+                };
+                let _ = self
+                    .webview
+                    .evaluate_script(&format!("window.vcStyle && vcStyle('{name}')"));
+                self.style_pending = false;
+            }
+            self.place();
+            #[cfg(target_os = "macos")]
+            self.panel.sync_frame_from(&self.window);
             #[cfg(not(target_os = "macos"))]
-            self.window.set_visible(want);
+            self.window.set_visible(true);
             #[cfg(target_os = "macos")]
-            self.panel.set_visible(want);
+            self.panel.set_visible(true);
             #[cfg(target_os = "macos")]
-            if want {
-                order_front_without_activating(&self.panel);
+            order_front_without_activating(&self.panel);
+            // A hidden WKWebView is suspended while VocalCode is not the
+            // active application. The phase script above can therefore be
+            // accepted without producing a frame, leaving the newly shown
+            // window in the transparent idle state. Re-apply the phase
+            // after ordering the native window, when WebKit is visible and
+            // must render it.
+            let _ = self.webview.evaluate_script(&display.script());
+            self.shown = true;
+            self.morph = self.pico_morph(true);
+        } else if !want && self.shown {
+            if self.morph.is_some() {
+                // A close is already running; let it finish.
+            } else if let Some(morph) = self.pico_morph(false) {
+                self.morph = Some(morph);
+            } else {
+                #[cfg(not(target_os = "macos"))]
+                self.window.set_visible(false);
+                #[cfg(target_os = "macos")]
+                self.panel.set_visible(false);
+                self.shown = false;
             }
-            if want {
-                // A hidden WKWebView is suspended while VocalCode is not the
-                // active application. The phase script above can therefore be
-                // accepted without producing a frame, leaving the newly shown
-                // window in the transparent idle state. Re-apply the phase
-                // after ordering the native window, when WebKit is visible and
-                // must render it.
-                let _ = self.webview.evaluate_script(&display.script());
-            }
-            self.shown = want;
         }
 
         if let Some(level) = self.meter_updates.next(self.shown, phase, level) {
@@ -729,11 +767,89 @@ impl Overlay {
                 .evaluate_script(&format!("window.vcLevel && vcLevel({level:.3})"));
         }
 
-        // Pico follows the pointer, so the window is re-placed every frame
-        // rather than only when it is shown. `place` is a no-op move when the
-        // pointer has not moved, which is most frames.
-        if self.shown && self.anchor == Anchor::Cursor {
-            self.place();
+        #[cfg(windows)]
+        self.animate_pico();
+    }
+
+    /// Start a Pico morph, or `None` when the window should just appear.
+    ///
+    /// Only the pointer-anchored surface morphs: the bottom-centre capsule has
+    /// no dot to grow out of, and its existing fade is enough.
+    #[cfg(windows)]
+    fn pico_morph(&self, opening: bool) -> Option<Morph> {
+        let animate = self.anchor == Anchor::Cursor && animations_enabled();
+        #[cfg(debug_assertions)]
+        log::info!(
+            "pico morph: opening={opening} animate={animate} anchor={:?}",
+            self.anchor
+        );
+        animate.then(|| Morph {
+            started: Instant::now(),
+            opening,
+        })
+    }
+
+    /// Advance the open/close animation and follow the pointer when idle.
+    ///
+    /// The native window and the page are driven together: the window is
+    /// interpolated between the dot's rectangle and the capsule's, and the page
+    /// is told the matching scale so the drawn pill always fills it exactly.
+    #[cfg(windows)]
+    fn animate_pico(&mut self) {
+        if !self.shown || self.anchor != Anchor::Cursor {
+            return;
+        }
+        let Some((x, y, full_w, full_h, scale)) = pico_target(&self.window, self.frame) else {
+            return;
+        };
+        let Some(morph) = self.morph else {
+            set_pico_rect(&self.window, (x, y, full_w, full_h));
+            return;
+        };
+        let duration = if morph.opening {
+            MORPH_OPEN
+        } else {
+            MORPH_CLOSE
+        };
+        let t = (morph.started.elapsed().as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+        // One progress value, where 1 is fully open and 0 is the bare dot, so
+        // opening and closing cannot drift apart. Ease out on the way open,
+        // ease in on the way closed.
+        let progress = if morph.opening {
+            1.0 - (1.0 - t).powi(3)
+        } else {
+            (1.0 - t).powi(2)
+        };
+        let dot = (PICO_DOT_LOGICAL * scale).round().max(6.0) as i32;
+        let width = dot + (((full_w - dot) as f32) * progress) as i32;
+        let height = dot + (((full_h - dot) as f32) * progress) as i32;
+        set_pico_rect(&self.window, (x, y, width.max(1), height.max(1)));
+        #[cfg(debug_assertions)]
+        log::info!(
+            "pico morph frame: opening={} t={:.2} progress={:.2} {}x{}",
+            morph.opening,
+            t,
+            progress,
+            width.max(1),
+            height.max(1)
+        );
+        let page_scale = width as f32 / full_w.max(1) as f32;
+        let _ = self.webview.evaluate_script(&format!(
+            "window.vcMorph && vcMorph({page_scale:.4}, {:.1}, {:.1})",
+            self.frame.0, self.frame.1
+        ));
+        if t < 1.0 {
+            return;
+        }
+        self.morph = None;
+        if morph.opening {
+            set_pico_rect(&self.window, (x, y, full_w, full_h));
+            let _ = self
+                .webview
+                .evaluate_script("window.vcMorph && vcMorph(1, 0, 0)");
+        } else {
+            self.window.set_visible(false);
+            self.shown = false;
         }
     }
 
@@ -1158,13 +1274,12 @@ fn make_inert_and_floating(panel: &MacPanel) {
     }
 }
 
-/// Put the capsule just below-right of the pointer, pulled back inside the
-/// monitor's work area and mirrored to the left when the right edge is close.
+/// Where the capsule should sit and how big it should be, in physical pixels.
 ///
-/// The offset is the same 10 logical pixels the dot uses, so the panel's corner
-/// lands exactly where the dot was: the panel appears to grow out of it.
+/// Returns `(x, y, width, height, scale)`. The offset is the same 10 logical
+/// pixels the dot uses, so the panel's corner lands exactly where the dot was.
 #[cfg(target_os = "windows")]
-fn position_at_cursor(window: &Window, size: (f64, f64)) -> bool {
+fn pico_target(window: &Window, size: (f64, f64)) -> Option<(i32, i32, i32, i32, f64)> {
     use std::mem::size_of;
 
     use windows_sys::Win32::Foundation::POINT;
@@ -1176,18 +1291,18 @@ fn position_at_cursor(window: &Window, size: (f64, f64)) -> bool {
 
     let mut point = POINT { x: 0, y: 0 };
     if unsafe { GetCursorPos(&mut point) } == 0 {
-        return false;
+        return None;
     }
     let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
     if monitor.is_null() {
-        return false;
+        return None;
     }
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..MONITORINFO::default()
     };
     if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
-        return false;
+        return None;
     }
     let mut dpi_x = 0;
     let mut dpi_y = 0;
@@ -1206,7 +1321,7 @@ fn position_at_cursor(window: &Window, size: (f64, f64)) -> bool {
         .max(i32::try_from(measured.width).unwrap_or(i32::MAX));
     let height = ((size.1 * scale).round().max(1.0) as i32)
         .max(i32::try_from(measured.height).unwrap_or(i32::MAX));
-    let gap = (10.0 * scale).round() as i32;
+    let gap = (PICO_OFFSET_LOGICAL * scale).round() as i32;
     let work = info.rcWork;
     let max_x = (work.right - width).max(work.left);
     let max_y = (work.bottom - height).max(work.top);
@@ -1221,11 +1336,57 @@ fn position_at_cursor(window: &Window, size: (f64, f64)) -> bool {
     if y > max_y {
         y = point.y - gap - height;
     }
-    window.set_outer_position(tao::dpi::PhysicalPosition::new(
+    Some((
         x.clamp(work.left, max_x),
         y.clamp(work.top, max_y),
-    ));
-    true
+        width,
+        height,
+        scale,
+    ))
+}
+
+/// Move and resize the capsule in one call, without activating it.
+#[cfg(target_os = "windows")]
+fn set_pico_rect(window: &Window, rect: (i32, i32, i32, i32)) {
+    use tao::platform::windows::WindowExtWindows as _;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE};
+
+    let (x, y, width, height) = rect;
+    unsafe {
+        SetWindowPos(
+            window.hwnd() as HWND,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Whether the user has left Windows' animations switched on.
+///
+/// Pico Mode honours the same preference the rest of the shell does: with
+/// animations off, the panel appears and disappears at full size instead of
+/// growing out of the dot.
+#[cfg(target_os = "windows")]
+fn animations_enabled() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
+    };
+
+    let mut enabled: i32 = 1;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            &mut enabled as *mut i32 as *mut core::ffi::c_void,
+            0,
+        );
+    }
+    enabled != 0
 }
 
 /// Put the indicator inside the work area of the monitor that owns the

@@ -257,6 +257,26 @@
       : (TRANSCRIBING_LABELS[languageCode] || "Transcribing…");
     runMeter(recording);
   };
+  // Pico Mode grows the panel out of the dot. The host animates the native
+  // window's rectangle; this keeps the drawn capsule at the matching scale so
+  // it fills the growing window instead of being clipped by it. Called with
+  // scale 1 (or a zero size) it restores the normal layout.
+  window.vcMorph = function (scale, width, height) {
+    var pill = document.getElementById("pill");
+    if (!pill) return;
+    if (!(scale < 0.999) || !(width > 0) || !(height > 0)) {
+      pill.style.transform = "";
+      pill.style.transformOrigin = "";
+      pill.style.width = "";
+      pill.style.height = "";
+      return;
+    }
+    pill.style.transformOrigin = "top left";
+    pill.style.width = width + "px";
+    pill.style.height = height + "px";
+    pill.style.transform = "scale(" + scale + ")";
+  };
+
   // Display metrics only. The passive surface has no recording or settings
   // authority, and still ignores all pointer input at the native window.
   var lastPageRatio=0,scaleQuery=null;
