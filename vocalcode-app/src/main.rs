@@ -11,6 +11,8 @@ mod calendar;
 mod community;
 #[cfg(windows)]
 mod control_bar;
+#[cfg(windows)]
+mod cursor_dot;
 mod diagnostics;
 mod dictation_control;
 mod inference;

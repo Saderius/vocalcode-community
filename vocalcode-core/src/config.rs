@@ -50,6 +50,22 @@ impl Default for WritingConfig {
     }
 }
 
+/// Opt-in pointer-anchored input: a dot that follows the cursor, and a
+/// double-click on an editable target to start or stop dictation.
+///
+/// Kept as its own `[cursor_input]` table for the same reason as `[writing]`:
+/// an older build ignores a table it does not know instead of refusing the
+/// whole settings file. That is what makes this feature reversible by simply
+/// turning it off, and it is why `CONFIG_VERSION` is not bumped for it — an
+/// added key changes no existing key's meaning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CursorInputConfig {
+    /// Show the dot and arm on editable targets. Off by default: this changes
+    /// how double-click behaves inside every editor, so it is opt-in.
+    pub enabled: bool,
+}
+
 impl WritingConfig {
     /// The rules for one dictation into `app` (exact identity, compared
     /// case-insensitively; an empty `app` means unknown).
@@ -536,6 +552,10 @@ pub struct Config {
     /// Last, so it serialises as the trailing `[writing]` table.
     #[serde(default)]
     pub writing: WritingConfig,
+    /// Opt-in cursor-anchored input. Its own trailing table; see
+    /// [`CursorInputConfig`].
+    #[serde(default)]
+    pub cursor_input: CursorInputConfig,
 }
 
 fn default_double_tap_lock() -> bool {
@@ -1029,6 +1049,7 @@ impl Default for Config {
             mute_while_dictating: false,
             keep_history: HistoryRetention::default(),
             writing: WritingConfig::default(),
+            cursor_input: CursorInputConfig::default(),
         }
     }
 }
@@ -1036,6 +1057,18 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cursor_input_is_an_additive_table_older_builds_can_ignore() {
+        let enabled: Config =
+            toml::from_str("config_version = 5\n[cursor_input]\nenabled = true\n").unwrap();
+        assert!(enabled.cursor_input.enabled);
+        // Absent table, and absent key inside it, both mean "off".
+        let absent: Config = toml::from_str("config_version = 5\n").unwrap();
+        assert!(!absent.cursor_input.enabled);
+        let empty: Config = toml::from_str("config_version = 5\n[cursor_input]\n").unwrap();
+        assert!(!empty.cursor_input.enabled);
+    }
+
     #[test]
     fn writing_is_opt_in_reversible_and_resolves_per_app() {
         let old: Config = toml::from_str("language = \"en\"").unwrap();

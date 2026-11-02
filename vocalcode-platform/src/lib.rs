@@ -33,6 +33,20 @@ pub(crate) mod input_windows;
 #[cfg(windows)]
 pub(crate) mod hook_windows;
 
+/// The pointer's last known position in physical screen coordinates.
+///
+/// Sampled by the Windows mouse hook, so it costs one relaxed load to read and
+/// is available on any thread. `None` before the first mouse event, and always
+/// `None` off Windows until an equivalent tap exists.
+#[cfg(windows)]
+pub use hook_windows::cursor_position;
+
+/// No pointer tap on this platform yet.
+#[cfg(not(windows))]
+pub fn cursor_position() -> Option<(i32, i32)> {
+    None
+}
+
 /// macOS native HID/Consumer/gamepad discovery and hot-plug callbacks.
 #[cfg(target_os = "macos")]
 pub(crate) mod input_macos;

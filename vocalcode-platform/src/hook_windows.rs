@@ -32,8 +32,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KillTimer, PostThreadMessageW, SetTimer,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG,
     MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 type Handler = Box<dyn FnMut(&EventType, bool) -> bool + Send>;
@@ -64,6 +64,44 @@ const HEARTBEAT_INTERVAL_MS: u32 = 1_000;
 const HEARTBEAT_STALL_TICKS: u32 = 4;
 static RENEW_REQUESTED: AtomicBool = AtomicBool::new(false);
 static HOOK_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+
+/// Screen position of the most recent mouse event, packed as
+/// `((x as u32 as u64) << 32) | (y as u32 as u64)`. [`POSITION_UNKNOWN`] means
+/// no mouse event has been seen yet.
+///
+/// This is written in the callback, before the button-edge filter, so it also
+/// tracks motion. That filter exists to keep the *handler* out of a 1000 Hz
+/// event stream; it was never meant to hide the position, which costs one
+/// relaxed store. See [`cursor_position`].
+static MOUSE_POSITION: AtomicU64 = AtomicU64::new(POSITION_UNKNOWN);
+const POSITION_UNKNOWN: u64 = u64::MAX;
+
+/// The pointer's last known position in physical screen coordinates, or `None`
+/// until the first mouse event after the hooks are installed.
+///
+/// Lock-free and safe to read from any thread: the hook callback may not block,
+/// so the position is published with a relaxed store rather than a mutex. It is
+/// a sample, not a subscription — a caller that needs to follow the pointer
+/// polls it on its own cadence.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let packed = MOUSE_POSITION.load(Ordering::Relaxed);
+    if packed == POSITION_UNKNOWN {
+        return None;
+    }
+    // The casts are deliberate: the hook reports signed screen coordinates, and
+    // monitors left of or above the primary one have negative origins.
+    let x = (packed >> 32) as u32 as i32;
+    let y = packed as u32 as i32;
+    Some((x, y))
+}
+
+#[inline]
+fn remember_position(x: i32, y: i32) {
+    MOUSE_POSITION.store(
+        ((x as u32 as u64) << 32) | (y as u32 as u64),
+        Ordering::Relaxed,
+    );
+}
 
 #[derive(Debug)]
 struct HeartbeatWatchdog {
@@ -187,6 +225,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         // lock; only button edges are worth a dispatch.
         let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
         let injected = mouse.flags & LLMHF_INJECTED != 0;
+        // Record the position for every mouse event, motion included. This is
+        // one relaxed store with no lock, no dispatch and no log, so it stays
+        // inside the callback budget the module contract requires.
+        remember_position(mouse.pt.x, mouse.pt.y);
         let event = match wparam as u32 {
             WM_LBUTTONDOWN => Some(EventType::ButtonPress(Button::Left)),
             WM_LBUTTONUP => Some(EventType::ButtonRelease(Button::Left)),
@@ -204,6 +246,8 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     Some(EventType::ButtonRelease(button))
                 }
             }
+            // Position captured above; motion still does not reach the handler.
+            WM_MOUSEMOVE => None,
             _ => None,
         };
         if let Some(event) = event {

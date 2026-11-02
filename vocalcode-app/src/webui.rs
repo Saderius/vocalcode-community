@@ -1440,6 +1440,13 @@ pub fn run(
         crate::paths::ensure_trusted_data_subdir(&base, std::path::Path::new("webview2/overlay"));
 
     let cfg_state = config;
+    log::info!(
+        "cursor input enabled at startup: {}",
+        cfg_state
+            .lock()
+            .map(|c| c.cursor_input.enabled)
+            .unwrap_or(false)
+    );
     let devices = vocalcode_platform::list_input_device_choices();
     let dictionary = crate::load_rules_document(&base);
     if let Err(error) = &dictionary {
@@ -1575,6 +1582,10 @@ pub fn run(
     let mut desktop_control: Option<crate::control_bar::ControlBar> = None;
     #[cfg(windows)]
     let mut desktop_control_attempted = false;
+    #[cfg(windows)]
+    let mut cursor_dot: Option<crate::cursor_dot::CursorDot> = None;
+    #[cfg(windows)]
+    let mut cursor_dot_attempted = false;
     let demo_overlay = std::env::var("VOCALCODE_OVERLAY_DEMO").as_deref() == Ok("1");
     // Notices and the tray tooltip follow the interface language. The last
     // value read is kept, so a contended config lock never blanks the copy.
@@ -1859,6 +1870,41 @@ pub fn run(
                     level: audio_level.get(),
                 }, &status.dictation_control);
                 if let (Some(deadline), ControlFlow::WaitUntil(existing)) = (bar.next_wake(Instant::now()), &mut *control_flow) {
+                    *existing = (*existing).min(deadline);
+                }
+            }
+        }
+        // The cursor dot is a follower: it samples the pointer every frame and
+        // asks for the next one. Its visual state stays Idle until the target
+        // probe exists (M2); for now this proves the window, the DPI handling
+        // and the click-through contract on a real desktop.
+        #[cfg(windows)]
+        if let Ok(c) = tick_cfg.try_lock() {
+            let enabled = c.cursor_input.enabled && !status.shutdown.load(Ordering::Acquire);
+            if enabled && !cursor_dot_attempted {
+                cursor_dot_attempted = true;
+                cursor_dot = match crate::cursor_dot::CursorDot::new(event_target) {
+                    Ok(dot) => {
+                        log::info!("cursor dot created");
+                        Some(dot)
+                    }
+                    Err(error) => {
+                        log::warn!("cursor dot unavailable: {error}");
+                        status.runtime_errors.push(
+                            "The cursor dot could not open. Dictation is unaffected.".to_string(),
+                        );
+                        None
+                    }
+                };
+            }
+            if !enabled {
+                cursor_dot = None;
+            }
+            if let Some(dot) = &mut cursor_dot {
+                dot.tick(crate::cursor_dot::CursorVisual::Idle);
+                if let (Some(deadline), ControlFlow::WaitUntil(existing)) =
+                    (Some(crate::cursor_dot::next_wake(Instant::now())), &mut *control_flow)
+                {
                     *existing = (*existing).min(deadline);
                 }
             }
