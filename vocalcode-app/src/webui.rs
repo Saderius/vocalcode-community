@@ -1919,7 +1919,17 @@ pub fn run(
                     true,
                     Instant::now(),
                 );
-                dot.tick(visual);
+                // The panel is the working form of the dot. While it is up the
+                // dot must be gone, or the same state would be drawn twice at
+                // the same place.
+                let dot_visual = match visual {
+                    crate::cursor_dot::CursorVisual::Listening
+                    | crate::cursor_dot::CursorVisual::Transcribing => {
+                        crate::cursor_dot::CursorVisual::Blocked
+                    }
+                    other => other,
+                };
+                dot.tick(dot_visual);
                 if let ControlFlow::WaitUntil(existing) = &mut *control_flow {
                     *existing = (*existing).min(crate::cursor_dot::next_wake(Instant::now()));
                 }
@@ -1970,11 +1980,23 @@ pub fn run(
             // does nothing when the value has not changed.
             // Suppression must not depend on obtaining a second config lock:
             // even a single contended tick must never show both indicators.
+            let mut pico = false;
             let configured_style = tick_cfg.try_lock().ok().map(|c| {
                 o.set_lang(&c.ui_lang);
+                pico = c.cursor_input.enabled;
+                o.set_anchor(if pico {
+                    crate::overlay::Anchor::Cursor
+                } else {
+                    crate::overlay::Anchor::Screen
+                });
                 crate::overlay::Style::parse(&c.overlay_style)
             });
-            if let Some(style) = crate::overlay::Style::alongside_capsule(configured_style, desktop_control_visible) {
+            // Pico owns the indication while it is on, so the desktop capsule's
+            // "stay off the bar" rule does not apply to it.
+            if let Some(style) = crate::overlay::Style::alongside_capsule(
+                configured_style,
+                desktop_control_visible && !pico,
+            ) {
                 o.set_style(style);
             }
             #[cfg(windows)]

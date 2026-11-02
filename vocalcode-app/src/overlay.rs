@@ -137,6 +137,16 @@ impl OverlayState {
     }
 }
 
+/// Where the indicator lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    /// The shipped position: bottom centre of the foreground monitor.
+    Screen,
+    /// Pico Mode: anchored to the pointer, so the panel opens out of the dot
+    /// instead of sitting far from the field the user is working in.
+    Cursor,
+}
+
 /// Which indicator the user asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
@@ -347,6 +357,8 @@ pub struct Overlay {
     frame: (f64, f64),
     meter_updates: MeterUpdates,
     style: Style,
+    /// Where the capsule is placed. Pico Mode follows the pointer.
+    anchor: Anchor,
     /// The style changed and the page has not been told yet.
     style_pending: bool,
     /// The interface language preference, and whether the page has it yet.
@@ -469,6 +481,7 @@ impl Overlay {
             frame: window_logical_size(Style::Classic),
             meter_updates: MeterUpdates::default(),
             style: Style::Classic,
+            anchor: Anchor::Screen,
             style_pending: false,
             lang: String::new(),
             lang_pending: false,
@@ -481,6 +494,18 @@ impl Overlay {
             #[cfg(windows)]
             keep_clear: None,
         })
+    }
+
+    /// Move the capsule between the shipped bottom-centre position and Pico
+    /// Mode's pointer anchor. Safe to call every tick.
+    pub fn set_anchor(&mut self, anchor: Anchor) {
+        if anchor == self.anchor {
+            return;
+        }
+        self.anchor = anchor;
+        if self.shown {
+            self.place();
+        }
     }
 
     /// Apply the user's choice. Safe to call on every tick; the page is only
@@ -551,7 +576,15 @@ impl Overlay {
 
     /// Put the window at the bottom centre of the screen in use and, on
     /// Windows, clear of the desktop capsule.
+    ///
+    /// In Pico Mode it follows the pointer instead, which is what makes the
+    /// panel read as growing out of the dot rather than as a second overlay
+    /// somewhere else on the screen.
     fn place(&self) {
+        #[cfg(windows)]
+        if self.anchor == Anchor::Cursor && position_at_cursor(&self.window, self.frame) {
+            return;
+        }
         #[cfg(windows)]
         if position_on_windows_work_area(&self.window, self.frame, self.keep_clear) {
             return;
@@ -694,6 +727,13 @@ impl Overlay {
             let _ = self
                 .webview
                 .evaluate_script(&format!("window.vcLevel && vcLevel({level:.3})"));
+        }
+
+        // Pico follows the pointer, so the window is re-placed every frame
+        // rather than only when it is shown. `place` is a no-op move when the
+        // pointer has not moved, which is most frames.
+        if self.shown && self.anchor == Anchor::Cursor {
+            self.place();
         }
     }
 
@@ -1116,6 +1156,76 @@ fn make_inert_and_floating(panel: &MacPanel) {
         // of date, so it goes.
         let _: () = objc2::msg_send![ns_window, setHasShadow: false];
     }
+}
+
+/// Put the capsule just below-right of the pointer, pulled back inside the
+/// monitor's work area and mirrored to the left when the right edge is close.
+///
+/// The offset is the same 10 logical pixels the dot uses, so the panel's corner
+/// lands exactly where the dot was: the panel appears to grow out of it.
+#[cfg(target_os = "windows")]
+fn position_at_cursor(window: &Window, size: (f64, f64)) -> bool {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return false;
+    }
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_null() {
+        return false;
+    }
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return false;
+    }
+    let mut dpi_x = 0;
+    let mut dpi_y = 0;
+    let scale = if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+        >= 0
+        && dpi_x > 0
+    {
+        f64::from(dpi_x) / 96.0
+    } else {
+        window.scale_factor()
+    };
+    // DWM adds an invisible border even to an undecorated window, so the live
+    // outer size wins over the requested one.
+    let measured = window.outer_size();
+    let width = ((size.0 * scale).round().max(1.0) as i32)
+        .max(i32::try_from(measured.width).unwrap_or(i32::MAX));
+    let height = ((size.1 * scale).round().max(1.0) as i32)
+        .max(i32::try_from(measured.height).unwrap_or(i32::MAX));
+    let gap = (10.0 * scale).round() as i32;
+    let work = info.rcWork;
+    let max_x = (work.right - width).max(work.left);
+    let max_y = (work.bottom - height).max(work.top);
+
+    let mut x = point.x + gap;
+    if x > max_x {
+        // No room on the right: open to the left instead of clamping on top of
+        // the field the user is typing into.
+        x = point.x - gap - width;
+    }
+    let mut y = point.y + gap;
+    if y > max_y {
+        y = point.y - gap - height;
+    }
+    window.set_outer_position(tao::dpi::PhysicalPosition::new(
+        x.clamp(work.left, max_x),
+        y.clamp(work.top, max_y),
+    ));
+    true
 }
 
 /// Put the indicator inside the work area of the monitor that owns the

@@ -180,6 +180,18 @@ impl<D: Desktop> CursorInput<D> {
         );
 
         let candidate = (click.time_ms, click.x, click.y);
+
+        // Click away to commit. While recording, a click that lands anywhere
+        // that is not a text target ends the utterance — the natural "I am done
+        // with this field" gesture, and the one people already expect from
+        // focus. A click *inside* the field is left alone: it is the user
+        // moving the caret, or the first half of the double-click that stops.
+        if recording && !self.desktop.armed() {
+            self.last_click = None;
+            self.toggle(snapshot, ready, recording, now);
+            return;
+        }
+
         if let Some(previous) = self.last_click {
             if is_double_click(previous, candidate) {
                 // Consume the pair: a third click must start a fresh gesture
@@ -233,7 +245,7 @@ mod tests {
     /// all set by the test.
     struct FakeDesktop {
         position: Cell<(i32, i32)>,
-        armed: bool,
+        armed: Cell<bool>,
         click: Cell<Option<PointerClick>>,
     }
 
@@ -241,7 +253,7 @@ mod tests {
         fn new(armed: bool) -> Self {
             Self {
                 position: Cell::new((500, 400)),
-                armed,
+                armed: Cell::new(armed),
                 click: Cell::new(None),
             }
         }
@@ -254,6 +266,11 @@ mod tests {
                 y: at.1,
                 time_ms: tick,
             }));
+        }
+
+        fn aim_at(&self, at: (i32, i32), armed: bool) {
+            self.position.set(at);
+            self.armed.set(armed);
         }
     }
 
@@ -268,7 +285,7 @@ mod tests {
             self.position.set((x, y));
         }
         fn armed(&self) -> bool {
-            self.armed
+            self.armed.get()
         }
     }
 
@@ -384,6 +401,51 @@ mod tests {
         input.desktop.press(3, (500, 400), 7_200);
         input.tick(snapshot(Phase::Idle), true, false, true, Instant::now());
         assert!(drain(&rx).is_empty());
+    }
+
+    #[test]
+    fn clicking_away_while_recording_stops_and_delivers() {
+        let (mut input, bridge, rx) = setup(true);
+        // Start the utterance with a double-click on the field.
+        input.desktop.press(1, (500, 400), 9_000);
+        input.tick(snapshot(Phase::Idle), true, false, true, Instant::now());
+        input.desktop.press(2, (500, 400), 9_120);
+        input.tick(snapshot(Phase::Idle), true, false, true, Instant::now());
+        let _ = drain(&rx);
+        let _ = bridge.take(snapshot(Phase::Idle), true, false, true, Instant::now());
+
+        // A single click somewhere that takes no text ends it.
+        input.desktop.aim_at((900, 700), false);
+        input.desktop.press(3, (900, 700), 12_000);
+        input.tick(snapshot(Phase::Recording), true, true, true, Instant::now());
+
+        let dispatch = bridge
+            .take(snapshot(Phase::Recording), true, true, true, Instant::now())
+            .expect("click-away must stop the recording");
+        assert_eq!(dispatch.event, TriggerEvent::ForceStop);
+    }
+
+    #[test]
+    fn a_single_click_inside_the_field_does_not_stop_the_recording() {
+        let (mut input, bridge, rx) = setup(true);
+        input.desktop.press(1, (500, 400), 10_000);
+        input.tick(snapshot(Phase::Idle), true, false, true, Instant::now());
+        input.desktop.press(2, (500, 400), 10_120);
+        input.tick(snapshot(Phase::Idle), true, false, true, Instant::now());
+        let _ = drain(&rx);
+        let _ = bridge.take(snapshot(Phase::Idle), true, false, true, Instant::now());
+
+        // Repositioning the caret inside the field must be an ordinary click.
+        input.desktop.press(3, (520, 410), 13_000);
+        input.tick(snapshot(Phase::Recording), true, true, true, Instant::now());
+
+        assert!(drain(&rx).is_empty(), "an inside click sends nothing");
+        assert!(
+            bridge
+                .take(snapshot(Phase::Recording), true, true, true, Instant::now())
+                .is_none(),
+            "the mailbox must stay empty"
+        );
     }
 
     #[test]

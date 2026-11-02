@@ -80,6 +80,12 @@ the controller's own `Bridge`.
 is over a target the probe says is editable. Double-clicking the desktop, the
 taskbar, a game, or an elevated window does nothing.
 
+**Click away to commit (decided with the user).** While recording, a single click
+that lands anywhere that is *not* a text target stops the utterance and delivers
+it. This is the gesture people already expect from focus: finish typing, click
+somewhere else, done. A click *inside* the field is left alone — it is either the
+user moving the caret or the first half of the double-click that stops.
+
 ### 3.3 "Recognising the current input"
 
 Two separate problems, only the first is new:
