@@ -128,9 +128,13 @@ impl CursorDot {
         })
     }
 
-    /// Follow the pointer and paint `visual`. Returns whether the dot is on
+    /// Paint `visual` and place the dot.
+    ///
+    /// With `snap` the dot stops following the pointer and sits in the bottom
+    /// right corner of that field rectangle — the field the user chose. Without
+    /// it, the dot trails the pointer as before. Returns whether the dot is on
     /// screen afterwards.
-    pub fn tick(&mut self, visual: CursorVisual) -> bool {
+    pub fn tick(&mut self, visual: CursorVisual, snap: Option<(i32, i32, i32, i32)>) -> bool {
         let Some((cursor_x, cursor_y)) = pointer_position() else {
             self.hide();
             return false;
@@ -139,14 +143,37 @@ impl CursorDot {
             self.hide();
             return false;
         }
-        let (work, scale) = self.screen_context(cursor_x, cursor_y);
+        // The monitor that matters is the one holding the field while a session
+        // is bound, and the one holding the pointer otherwise.
+        let anchor = match snap {
+            Some((left, top, right, bottom)) => {
+                (left + (right - left) / 2, top + (bottom - top) / 2)
+            }
+            None => (cursor_x, cursor_y),
+        };
+        let (work, scale) = self.screen_context(anchor.0, anchor.1);
         let diameter = (DOT_LOGICAL * scale).round().max(6.0) as i32;
-        let offset = (OFFSET_LOGICAL * scale).round() as i32;
-        // Keep the dot on the monitor the pointer is on. A dot half off the
-        // edge is unreadable, and on the far right the offset would leave the
-        // screen entirely.
-        let x = (cursor_x + offset).clamp(work.0, work.2 - diameter);
-        let y = (cursor_y + offset).clamp(work.1, work.3 - diameter);
+        let (x, y) = match snap {
+            Some((_, _, right, bottom)) => {
+                // Inside the field's corner, so it reads as belonging to the
+                // field rather than floating over it.
+                let inset = (6.0 * scale).round() as i32;
+                (
+                    (right - diameter - inset).clamp(work.0, work.2 - diameter),
+                    (bottom - diameter - inset).clamp(work.1, work.3 - diameter),
+                )
+            }
+            None => {
+                let offset = (OFFSET_LOGICAL * scale).round() as i32;
+                // Keep the dot on the monitor the pointer is on. A dot half off
+                // the edge is unreadable, and on the far right the offset would
+                // leave the screen entirely.
+                (
+                    (cursor_x + offset).clamp(work.0, work.2 - diameter),
+                    (cursor_y + offset).clamp(work.1, work.3 - diameter),
+                )
+            }
+        };
         let bounds = (x, y, diameter);
         if self.last_bounds != Some(bounds) {
             self.diameter = diameter;

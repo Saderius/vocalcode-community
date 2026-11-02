@@ -1326,6 +1326,20 @@ fn pico_target(window: &Window, size: (f64, f64)) -> Option<(i32, i32, i32, i32,
     let max_x = (work.right - width).max(work.left);
     let max_y = (work.bottom - height).max(work.top);
 
+    // A bound session belongs to the field, not the pointer. Sit in the
+    // field's bottom-right corner so the panel reads as part of it, and so it
+    // stays put while the user's hand moves away.
+    if let Some((_, _, right, bottom)) = vocalcode_platform::inject::pinned_target_rect() {
+        let inset = (6.0 * scale).round() as i32;
+        return Some((
+            (right - width - inset).clamp(work.left, max_x),
+            (bottom - height - inset).clamp(work.top, max_y),
+            width,
+            height,
+            scale,
+        ));
+    }
+
     let mut x = point.x + gap;
     if x > max_x {
         // No room on the right: open to the left instead of clamping on top of

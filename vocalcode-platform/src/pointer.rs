@@ -12,6 +12,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,8 @@ const UNKNOWN: u64 = u64::MAX;
 pub struct PointProbe {
     point: Arc<AtomicU64>,
     armed: Arc<AtomicBool>,
+    /// The last target the probe resolved, with its rectangle and identity.
+    last: Arc<Mutex<Option<crate::inject::PinnedTarget>>>,
     updated_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     started: Instant,
@@ -38,12 +41,14 @@ impl PointProbe {
     pub fn new() -> Self {
         let point = Arc::new(AtomicU64::new(UNKNOWN));
         let armed = Arc::new(AtomicBool::new(false));
+        let last: Arc<Mutex<Option<crate::inject::PinnedTarget>>> = Arc::new(Mutex::new(None));
         let updated_ms = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
         let worker = {
             let point = point.clone();
             let armed = armed.clone();
+            let last = last.clone();
             let updated_ms = updated_ms.clone();
             let stop = stop.clone();
             std::thread::Builder::new()
@@ -54,11 +59,14 @@ impl PointProbe {
                         if packed != UNKNOWN {
                             let x = (packed >> 32) as u32 as i32;
                             let y = packed as u32 as i32;
-                            let editable = crate::inject::text_target_at_point(x, y);
+                            let target = crate::inject::target_at_point(x, y);
                             // Publish the timestamp *after* the answer: a probe
                             // that never returns leaves the old value in place,
                             // and `armed` then reports false once it is stale.
-                            armed.store(editable, Ordering::Release);
+                            armed.store(target.is_some(), Ordering::Release);
+                            if let Ok(mut slot) = last.lock() {
+                                *slot = target;
+                            }
                             updated_ms
                                 .store(started.elapsed().as_millis() as u64, Ordering::Release);
                         }
@@ -69,6 +77,7 @@ impl PointProbe {
         };
         Self {
             point,
+            last,
             armed,
             updated_ms,
             stop,
@@ -83,6 +92,18 @@ impl PointProbe {
             ((x as u32 as u64) << 32) | (y as u32 as u64),
             Ordering::Release,
         );
+    }
+
+    /// The target the probe last resolved, if its answer is still fresh.
+    ///
+    /// This is what a double-click pins: the probe has already paid for the UI
+    /// Automation round trip, so the controller gets the field's identity and
+    /// rectangle without another call that could block.
+    pub fn last_target(&self) -> Option<crate::inject::PinnedTarget> {
+        if !self.armed() {
+            return None;
+        }
+        self.last.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Whether the last completed probe found an editable target, and whether

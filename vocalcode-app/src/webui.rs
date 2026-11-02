@@ -1929,7 +1929,7 @@ pub fn run(
                     }
                     other => other,
                 };
-                dot.tick(dot_visual);
+                dot.tick(dot_visual, controller.snap_rect());
                 if let ControlFlow::WaitUntil(existing) = &mut *control_flow {
                     *existing = (*existing).min(crate::cursor_dot::next_wake(Instant::now()));
                 }

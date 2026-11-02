@@ -17,7 +17,7 @@
 //! doing, so it is opt-in rather than the default.
 
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use vocalcode_core::error::{Result, VocalCodeError};
@@ -663,6 +663,179 @@ pub fn collapse_selection() {
 /// No pointer tap on this platform yet.
 #[cfg(not(windows))]
 pub fn collapse_selection() {}
+
+/// A text field the user deliberately chose with a double-click.
+///
+/// The whole point of cursor-native input is that the session belongs to the
+/// *field*, not to the pointer. This is what makes that true: the element's
+/// identity (so it can be focused again) and its rectangle (so the widget can
+/// sit on it). It survives the user clicking away, which is exactly when a
+/// transcript used to be diverted to the clipboard.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct PinnedTarget {
+    token: FocusToken,
+    /// Physical screen rectangle: `(left, top, right, bottom)`.
+    pub rect: (i32, i32, i32, i32),
+}
+
+#[cfg(windows)]
+static PINNED_TARGET: OnceLock<Mutex<Option<PinnedTarget>>> = OnceLock::new();
+
+#[cfg(windows)]
+fn pinned_slot() -> &'static Mutex<Option<PinnedTarget>> {
+    PINNED_TARGET.get_or_init(|| Mutex::new(None))
+}
+
+/// Bind the next transcript to `target`, whatever the pointer does next.
+#[cfg(windows)]
+pub fn pin_target(target: PinnedTarget) {
+    if let Ok(mut slot) = pinned_slot().lock() {
+        *slot = Some(target);
+    }
+}
+
+/// Forget the pinned field. Called when a session ends, so a stale pin can never
+/// capture a later utterance.
+#[cfg(windows)]
+pub fn clear_pinned_target() {
+    if let Ok(mut slot) = pinned_slot().lock() {
+        *slot = None;
+    }
+}
+
+/// The rectangle of the pinned field, for the widget to sit against.
+#[cfg(windows)]
+pub fn pinned_target_rect() -> Option<(i32, i32, i32, i32)> {
+    pinned_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|target| target.rect))
+}
+
+#[cfg(windows)]
+fn pinned_target() -> Option<PinnedTarget> {
+    pinned_slot().lock().ok().and_then(|slot| slot.clone())
+}
+
+/// Give the keyboard back to the field the user chose.
+///
+/// Clicking away moved focus, but it did not move the user's intent: the words
+/// belong to the field they double-clicked. Restoring focus is the only way to
+/// type there, because Windows will not deliver keystrokes to an unfocused
+/// control.
+///
+/// `SetForegroundWindow` also restores the control that window itself last had
+/// focused, which is the one the user clicked, so the common case needs nothing
+/// more. The token check afterwards is what makes the caller safe: if a
+/// different control ends up focused, this reports failure and the transcript
+/// takes the existing recoverable path instead of being typed somewhere wrong.
+#[cfg(windows)]
+pub fn focus_pinned(target: &PinnedTarget) -> bool {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    // Declared here: the windows-sys projection does not expose it under any
+    // feature this crate enables.
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
+        fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+
+    let hwnd = target.token.foreground_window as usize as HWND;
+    unsafe {
+        if GetForegroundWindow() != hwnd {
+            // Windows refuses `SetForegroundWindow` from a process that is not
+            // already foreground, which is exactly the case after the user
+            // clicked away. Joining the foreground thread's input queue for the
+            // duration of the call is the documented way through that lock, and
+            // unlike a synthetic keypress it does not disturb the user's input.
+            let foreground = GetForegroundWindow();
+            let foreground_thread = if foreground.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+            };
+            let this_thread = GetCurrentThreadId();
+            let attached = foreground_thread != 0
+                && foreground_thread != this_thread
+                && AttachThreadInput(this_thread, foreground_thread, 1) != 0;
+            SetForegroundWindow(hwnd);
+            if attached {
+                AttachThreadInput(this_thread, foreground_thread, 0);
+            }
+            // Joining the input queue is not always enough: Windows also
+            // requires the caller to have produced the most recent input. A
+            // synthetic ALT press is the documented way to satisfy that, and it
+            // is what any window-activating tool ends up doing.
+            if GetForegroundWindow() != hwnd {
+                const VK_MENU: u8 = 0x12;
+                const KEYEVENTF_KEYUP: u32 = 0x0002;
+                keybd_event(VK_MENU, 0, 0, 0);
+                keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+                SetForegroundWindow(hwnd);
+            }
+            // The window manager applies activation asynchronously.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    }
+    let current = current_focus();
+    #[cfg(debug_assertions)]
+    log::info!(
+        "focus_pinned: foreground_restored={} token_matches={}",
+        unsafe { GetForegroundWindow() } == hwnd,
+        current.as_ref() == Some(&target.token)
+    );
+    current.as_ref() == Some(&target.token)
+}
+/// The control under a physical screen point, when it would accept text.
+///
+/// Returns the element's identity and its rectangle together: the rectangle is
+/// what the widget snaps to, the identity is what delivery re-focuses.
+#[cfg(windows)]
+pub fn target_at_point(x: i32, y: i32) -> Option<PinnedTarget> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+
+    with_cached_automation(|automation| {
+        let point = windows::Win32::Foundation::POINT { x, y };
+        let element = unsafe { automation.ElementFromPoint(point) }.ok()?;
+        if !windows_element_accepts_text(&element) {
+            return None;
+        }
+        let rect = unsafe { element.CurrentBoundingRectangle() }.ok()?;
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return None;
+        }
+        let process_id = unsafe { element.CurrentProcessId() }.ok()?;
+        if process_id <= 0 {
+            return None;
+        }
+        let runtime_id = unsafe { copy_runtime_id(element.GetRuntimeId().ok()?) }?;
+        let native_window = windows_native_window_ancestor(automation, &element)?;
+        let root = unsafe { GetAncestor(native_window.0, GA_ROOT) };
+        // The window to bring back is the element's own top-level window, which
+        // is not necessarily the foreground one at pin time.
+        let window = if root.is_null() {
+            unsafe { GetForegroundWindow() }
+        } else {
+            root
+        };
+        if window.is_null() {
+            return None;
+        }
+        Some(PinnedTarget {
+            token: FocusToken {
+                process_id: process_id as u32,
+                foreground_window: window as usize as u64,
+                runtime_id,
+            },
+            rect: (rect.left, rect.top, rect.right, rect.bottom),
+        })
+    })
+}
 
 /// The focused control, when synthesised text would actually land there as
 /// text.
@@ -1938,6 +2111,26 @@ impl EnigoInjector {
     }
 }
 
+/// Type into a control that has already been accepted as a text target.
+///
+/// Re-arming to the exact target keeps the per-chunk focus checks meaningful:
+/// they go on catching a move *during* one insertion, which would spray the
+/// rest of a sentence elsewhere, without re-litigating the move that was
+/// already accepted.
+fn insert_into(injector: &EnigoInjector, target: FocusToken, text: &str) -> Result<()> {
+    injector.arm_focus(target)?;
+    if injector.paste {
+        injector.paste_text(text)
+    } else if needs_paste(text) {
+        // Synthesised typing turns a newline into an Enter press and a tab into
+        // Tab: in a chat box the first line is sent and the rest lands in the
+        // next message; elsewhere focus jumps. A paste inserts them as text.
+        injector.paste_text(&clipboard_line_breaks(text))
+    } else {
+        injector.type_text(text)
+    }
+}
+
 /// Text that cannot be typed faithfully as synthesised key events.
 fn needs_paste(text: &str) -> bool {
     text.contains(['\n', '\r', '\t'])
@@ -2048,6 +2241,23 @@ impl TextInjector for EnigoInjector {
         if text.is_empty() {
             return Ok(());
         }
+        // A pinned field wins over whatever happens to be focused. The user
+        // chose it with a double-click; clicking away moved the pointer, not
+        // the intent, and losing the sentence to the clipboard is exactly the
+        // failure this exists to prevent.
+        #[cfg(windows)]
+        if let Some(pinned) = pinned_target() {
+            if focus_pinned(&pinned) {
+                #[cfg(debug_assertions)]
+                log::info!(
+                    "inject: {} chars into the pinned field",
+                    text.chars().count()
+                );
+                return insert_into(self, pinned.token, text);
+            }
+            #[cfg(debug_assertions)]
+            log::info!("inject: the pinned field could not be refocused");
+        }
         let delivery = self.delivery()?;
         #[cfg(debug_assertions)]
         log::info!(
@@ -2059,26 +2269,7 @@ impl TextInjector for EnigoInjector {
             }
         );
         match delivery {
-            Delivery::Type(target) => {
-                // Re-arm to the control actually about to be typed into. The
-                // checks inside the typing and pasting paths then go on doing
-                // the job they were written for — catching focus moving *during*
-                // one insertion, which would spray the rest of a sentence into
-                // whatever arrived — instead of re-litigating the move that
-                // already happened and was already accepted here.
-                self.arm_focus(target)?;
-                if self.paste {
-                    self.paste_text(text)
-                } else if needs_paste(text) {
-                    // Synthesised typing turns "\n" into an Enter press and
-                    // "\t" into Tab: in a chat box the first line is sent and
-                    // the rest lands in the next message; elsewhere focus
-                    // jumps. A paste inserts line breaks and tabs as text.
-                    self.paste_text(&clipboard_line_breaks(text))
-                } else {
-                    self.type_text(text)
-                }
-            }
+            Delivery::Type(target) => insert_into(self, target, text),
             Delivery::Clipboard => {
                 write_clipboard_text(text)?;
                 Err(VocalCodeError::Diverted(no_text_target_message()))
@@ -2086,6 +2277,12 @@ impl TextInjector for EnigoInjector {
         }
     }
 
+    /// Type into a known-good control.
+    ///
+    /// Re-arming to the exact target is what keeps the per-chunk focus checks
+    /// meaningful: they go on catching a move *during* one insertion, which
+    /// would spray the rest of a sentence elsewhere, without re-litigating the
+    /// move that was already accepted.
     fn send_enter(&self) -> Result<()> {
         let mut enigo = Self::enigo()?;
         enigo

@@ -71,6 +71,7 @@ pub(crate) trait Desktop {
     fn last_click(&self) -> Option<PointerClick>;
     fn aim(&self, x: i32, y: i32);
     fn armed(&self) -> bool;
+    fn last_target(&self) -> Option<vocalcode_platform::inject::PinnedTarget>;
 }
 
 pub(crate) struct WindowsDesktop {
@@ -90,6 +91,9 @@ impl Desktop for WindowsDesktop {
     fn armed(&self) -> bool {
         self.probe.armed()
     }
+    fn last_target(&self) -> Option<vocalcode_platform::inject::PinnedTarget> {
+        self.probe.last_target()
+    }
 }
 
 pub struct CursorInput<D: Desktop = WindowsDesktop> {
@@ -102,6 +106,11 @@ pub struct CursorInput<D: Desktop = WindowsDesktop> {
     /// double-click.
     last_click: Option<(u32, i32, i32)>,
     visual: CursorVisual,
+    /// A field is pinned for the current utterance.
+    session: bool,
+    /// The session has actually been seen recording or transcribing, so a
+    /// later idle really means it finished.
+    seen_active: bool,
 }
 
 impl CursorInput<WindowsDesktop> {
@@ -123,6 +132,8 @@ impl<D: Desktop> CursorInput<D> {
             last_seq: 0,
             last_click: None,
             visual: CursorVisual::Idle,
+            session: false,
+            seen_active: false,
         }
     }
 
@@ -138,7 +149,23 @@ impl<D: Desktop> CursorInput<D> {
         if !enabled {
             self.last_click = None;
             self.visual = CursorVisual::Idle;
+            vocalcode_platform::inject::clear_pinned_target();
+            self.session = false;
             return self.visual;
+        }
+        // The utterance is over once the engine has stopped recording and
+        // finished transcribing. Release the field then, so a later dictation
+        // can never be captured by a stale pin.
+        if self.session {
+            if recording || snapshot.phase == Phase::Transcribing {
+                self.seen_active = true;
+            } else if self.seen_active {
+                // The utterance really finished. Release the field so a later
+                // dictation cannot be captured by a stale pin.
+                vocalcode_platform::inject::clear_pinned_target();
+                self.session = false;
+                self.seen_active = false;
+            }
         }
         if let Some((x, y)) = self.desktop.position() {
             self.desktop.aim(x, y);
@@ -160,6 +187,17 @@ impl<D: Desktop> CursorInput<D> {
             self.visual = next;
         }
         self.visual
+    }
+
+    /// The field rectangle the widget should sit on while a session is bound.
+    ///
+    /// `None` means the dot follows the pointer, which is the resting state.
+    pub fn snap_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        if self.session {
+            vocalcode_platform::inject::pinned_target_rect()
+        } else {
+            None
+        }
     }
 
     fn consume_click(&mut self, snapshot: Snapshot, ready: bool, recording: bool, now: Instant) {
@@ -220,6 +258,16 @@ impl<D: Desktop> CursorInput<D> {
             Ok(()) => {
                 log::info!("cursor input: {action:?} requested");
                 if action == Action::Start {
+                    // Bind the utterance to the field the user double-clicked.
+                    // From here on the pointer may go anywhere; the words still
+                    // belong to this field.
+                    if let Some(target) = self.desktop.last_target() {
+                        log::info!("cursor input: pinning the field under the click");
+                        vocalcode_platform::inject::pin_target(target);
+                        self.session = true;
+                    } else {
+                        log::info!("cursor input: no field to pin");
+                    }
                     // The double-click selected a word before we saw it; put the
                     // caret after that word so dictation appends instead of
                     // replacing it. Not in tests: this would type into whatever
@@ -286,6 +334,9 @@ mod tests {
         }
         fn armed(&self) -> bool {
             self.armed.get()
+        }
+        fn last_target(&self) -> Option<vocalcode_platform::inject::PinnedTarget> {
+            None
         }
     }
 
